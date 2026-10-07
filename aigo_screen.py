@@ -6,6 +6,7 @@
 本模块实现了副屏的完整通讯协议:
   1. 0x5A 控制帧(文本协议): 握手、设备控制
   2. 0x5C 画面帧(二进制分块): JPEG 图片推流
+  3. 普通媒体上传: JPG/PNG/MP4 背景，完成后由屏幕本地显示
 
 设备信息:
   - USB HID 设备: VID 0x1D6B (7531), PID 0x0103 (259)
@@ -18,8 +19,10 @@
 """
 
 import json
+import math
 import struct
 import time
+from pathlib import Path
 
 import hid
 
@@ -32,6 +35,8 @@ SCREEN_H = 462
 JPEG_QUALITY = 85
 IMG_CHUNK = 1000            # 画面帧每块数据字节数
 FRAME_HEADER_SIZE = 24      # 画面帧头字节数
+MAX_OFFLINE_FILE_SIZE = 32 * 1024 * 1024  # 官方主机配置值，作为 demo 的保守上限
+MEDIA_TYPES = {".mp4": 0, ".jpg": 1, ".png": 2}
 
 
 # =====================================================================
@@ -124,11 +129,70 @@ def extract_control_payload(buf: bytes):
     if i < 0:
         return None, buf
     raw = _unescape(buf[3:i])
+    if not raw:
+        return extract_control_payload(buf[i + 1:])
     payload = raw[:-1]
     checksum = raw[-1]
     if (sum(len_field) + sum(payload)) & 0xFF != checksum:
         return extract_control_payload(buf[1:])
     return payload, buf[i + 1:]
+
+
+def parse_response(payload: bytes):
+    """解析已校验控制帧中的状态码、headers、原始 body。"""
+    head, separator, body = payload.partition(b"\r\n\r\n")
+    if not separator:
+        raise ValueError("响应缺少 header/body 分隔符")
+    lines = head.decode("ascii").split("\r\n")
+    version, status = lines[0].split()
+    if version != "1":
+        raise ValueError("不支持的协议版本: " + version)
+    headers = dict(line.split("=", 1) for line in lines[1:] if line)
+    if "ContentLength" in headers and int(headers["ContentLength"]) != len(body):
+        raise ValueError("响应 ContentLength 不匹配")
+    return int(status), headers, body
+
+
+def validate_media_file(path, device_name=None):
+    """离线上传只允许普通 JPG/PNG/MP4，不进入 ZIP 固件上传路径。"""
+    path = Path(path)
+    media_type = MEDIA_TYPES.get(path.suffix.lower())
+    if media_type is None:
+        raise ValueError("仅支持 .jpg、.png、.mp4 普通媒体文件")
+    size = path.stat().st_size
+    if not path.is_file() or not 0 < size <= MAX_OFFLINE_FILE_SIZE:
+        raise ValueError("媒体必须是非空文件，且不超过 demo 的 32 MiB 上限")
+    name = device_name if device_name is not None else path.stem + path.suffix.lower()
+    if (not name or any(c in name for c in "/\\\x00\r\n")
+            or len(name.encode("utf-8")) > 255
+            or Path(name).suffix not in MEDIA_TYPES
+            or MEDIA_TYPES[Path(name).suffix] != media_type):
+        raise ValueError("屏端文件名须为同格式的小写扩展名，不能含目录或控制字符")
+    with path.open("rb") as source:
+        signature = source.read(12)
+    valid = (signature.startswith(b"\xff\xd8") if media_type == 1 else
+             signature.startswith(b"\x89PNG\r\n\x1a\n") if media_type == 2 else
+             signature[4:8] == b"ftyp")
+    if not valid:
+        raise ValueError("文件签名与扩展名不匹配")
+    return path, name, size, media_type
+
+
+def iter_media_blocks(source, file_size, media_type, frame_seq=21):
+    """从文件流生成 0x5C 块；MP4=0、JPG=1、PNG=2，每块 1000 字节。"""
+    count = math.ceil(file_size / IMG_CHUNK)
+    if not 0 < count <= 65535 or media_type not in MEDIA_TYPES.values():
+        raise ValueError("无效的媒体大小或类型")
+    for index in range(count):
+        chunk = source.read(min(IMG_CHUNK, file_size - index * IMG_CHUNK))
+        expected = min(IMG_CHUNK, file_size - index * IMG_CHUNK)
+        if len(chunk) != expected:
+            raise ValueError("上传文件读取不足，文件可能已改变")
+        header = struct.pack(">BHBHHB15x", 0x5C, 21 + len(chunk),
+                             frame_seq & 0xFF, count, index, media_type)
+        yield header + chunk
+    if source.read(1):
+        raise ValueError("上传文件大小已改变")
 
 
 # =====================================================================
@@ -180,6 +244,7 @@ class AigoScreen:
     def __init__(self):
         self.dev = None
         self.frame_seq = 21          # 官方初始帧号
+        self._read_buffer = b""
 
     def open(self):
         for d in hid.enumerate(VID, PID):
@@ -194,31 +259,102 @@ class AigoScreen:
         if self.dev:
             self.dev.close()
             self.dev = None
+        self._read_buffer = b""
 
     def _write(self, data: bytes):
         """HID 写入,首字节为 report id 0x00。"""
-        self.dev.write(b"\x00" + data)
+        if len(data) > REPORT_SIZE - 1:
+            raise ValueError("单帧超过 HID 报告大小")
+        report = b"\x00" + data.ljust(REPORT_SIZE - 1, b"\x00")
+        if self.dev.write(report) != REPORT_SIZE:
+            raise OSError("HID 写入不完整")
 
     def _read_payload(self, timeout=3.0):
         """读取一个完整的 0x5A 响应 payload。"""
-        buf = b""
-        end = time.time() + timeout
-        while time.time() < end:
-            d = bytes(self.dev.read(REPORT_SIZE, 200))
+        end = time.monotonic() + timeout
+        while True:
+            p, self._read_buffer = extract_control_payload(self._read_buffer)
+            if p is not None:
+                return p
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return None
+            d = bytes(self.dev.read(REPORT_SIZE, max(1, min(200, int(remaining * 1000)))))
             if d:
                 if d[0] == 0x00:
                     d = d[1:]
-                buf += d
-                p, rest = extract_control_payload(buf)
-                if p is not None:
-                    return p
-                buf = rest if rest else b""
-        return None
+                self._read_buffer += d
 
     def request(self, method: str, cmd: str, seq: int, body=None):
         """发送控制命令并读取响应 payload。"""
         self._write(build_control_frame(build_request(method, cmd, seq, body)))
         return self._read_payload()
+
+    def _wait_success(self, expected_ack, timeout):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            payload = self._read_payload(end - time.monotonic())
+            if payload is None:
+                break
+            status, headers, body = parse_response(payload)
+            if status != 200:
+                raise RuntimeError("设备返回状态码 %d (AckNumber=%s)" %
+                                   (status, headers.get("AckNumber")))
+            if int(headers.get("AckNumber", -1)) == expected_ack:
+                return body
+        raise TimeoutError("等待 AckNumber=%d 超时；请确认官方软件已完全退出" % expected_ack)
+
+    def request_checked(self, method, cmd, seq, body=None, timeout=3.0):
+        """确认状态码 200 及 AckNumber=SeqNumber+1，返回原始响应 body。"""
+        self._write(build_control_frame(build_request(method, cmd, seq, body)))
+        return self._wait_success(seq + 1, timeout)
+
+    def upload_offline(self, path, device_name=None, brightness=100,
+                       block_delay=0.015, progress=None):
+        """普通媒体上传；成功后设备本地显示，调用者应关闭 HID 后退出。
+
+        JPG 与无音轨 H.264 MP4 已在 V1.0.12 验证。PNG 类型来自官方实现。
+        修改 brightness、timeout、realtimeDisplay、osdState，不改 mode/logo。
+        失败不保证回滚已写入的媒体；重新运行官方软件可恢复主机主题。
+        """
+        path, name, size, media_type = validate_media_file(path, device_name)
+        if not 0 <= brightness <= 100 or not 0 <= block_delay <= 1:
+            raise ValueError("亮度应为 0~100，块间隔应为 0~1 秒")
+        seq = 0
+
+        def post(command, body=None, timeout=3.0):
+            nonlocal seq
+            result = self.request_checked("POST", command, seq, body, timeout)
+            seq += 1
+            return result
+
+        before = json.loads(post("conn"))
+        space = before.get("space")
+        # KiB 是实测差值支持的单位推断，不是固件声明的总容量。
+        if isinstance(space, (int, float)) and space * 1024 < size + 4 * 1024 * 1024:
+            raise ValueError("报告的可用空间不足以存放文件及 4 MiB 余量（space 按 KiB 估算）")
+        with path.open("rb") as source:
+            post("power", {"event": "resume"})
+            post("brightness", {"value": brightness})
+            post("timeout", {"value": 0})
+            post("realtimeDisplay", {"enable": False})
+            post("osdState", {"enable": False})
+            post("transport", {"type": "media", "fileSize": size, "fileName": name})
+            count = math.ceil(size / IMG_CHUNK)
+            for index, block in enumerate(iter_media_blocks(source, size, media_type), 1):
+                self._write(block)
+                # 15 ms 默认间隔与已经验证的上传工具一致。
+                if index < count and block_delay:
+                    time.sleep(block_delay)
+                if progress:
+                    progress(index, count)
+            # V1.0.12 的媒体块完成响应为 1 200 / AckNumber=0。
+            self._wait_success(0, 5.0)
+            post("transported", {"md5": "todo", "fileName": name}, timeout=10.0)
+        after = json.loads(post("conn"))
+        if name not in after.get("background", []):
+            raise RuntimeError("上传已确认，但屏端 background 列表中没有目标文件")
+        return {"fileName": name, "fileSize": size, "before": before, "after": after}
 
     def handshake(self):
         """
